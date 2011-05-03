@@ -1,0 +1,511 @@
+#!/usr/bin/perl -w
+
+use strict;
+use Getopt::Long;
+use vars qw($VERSION);
+
+my $myself          = $0;
+my $function_name   = "";
+my $input_file      = "";
+my $output_file     = "";
+my $parameter_count = 0;
+my $is_child        = 0;
+my $is_parent       = 0;
+
+GetOptions('name=s' => \$function_name,
+	   'input=s' => \$input_file,
+	   'output=s' => \$output_file,
+	   'parameters=n' => \$parameter_count,
+	   'child=n' => \$is_child,
+	   'parent=n' => \$is_parent);
+
+if (not $is_parent and not $is_child) {
+  #
+  # If we have not been called to generate a parent or child code
+  # stub, then we are likely being invoked by the user.  This means
+  # they want us to generate both the parent and child code stubs.
+  #  
+  my $name = $ARGV[0];
+  chomp($name);
+  $name =~ s/\.bc//;
+  exec "$myself --name=$name --input=$ARGV[0] --output=$name.cc --parent=1" or die 
+    "Failed to create parent code.";
+  exit;
+}
+
+if ($is_parent) {
+  print "Generating parent code.\n";
+}
+
+if ($is_child) {
+  print "Generating child code for $function_name.\n";
+} 
+
+#$/ = '';
+my @spawns = ();
+my %children = ();
+
+open INPUT,  "<$input_file" or die "INPUT ERROR: $input_file, $!";
+open OUTPUT, "+>$output_file" or die "OUTPUT ERROR: $output_file, $!";
+
+#
+# If we are generating code, then we need a few constants to be
+# declared.
+#
+print OUTPUT <<"EOT";
+
+/* Some headers we need */
+#include <grp.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <stdarg.h>
+#include <string.h>
+#include <sys/stat.h> 
+#include <unistd.h>
+
+/* How many command-line options are being passed in to a child
+   process by its parent */
+static int const  __BIRDCILK_N            = $parameter_count;
+
+/* The job-priority used when constructing a child job */
+static int        __BIRDCILK_PRIORITY     = 1;
+
+/* The cluster-id of this job */
+static int        __BIRDCILK_CLUSTER_ID   = 1;
+
+/* The process-id of this job */
+static int        __BIRDCILK_PROCESS_ID   = 1;
+
+/* The root directory of the Condor installation */
+static char const *__BIRDCILK_CONDOR_HOME = "/home/condor/binaries/condor/Linux-i686";
+
+/* Procedure prototype */
+void __birdcilk_spawn(int id, char const *function, char const *variable, int n, ...);
+void __birdcilk_wait(int id, char const *function, char const *variable, double *presult);
+void __birdcilk_cleanup(int id, char const *function, char const *variable);
+
+EOT
+
+while (<INPUT>) {
+  chomp;
+  #
+  # If we are dealing with generating the child code, then we want to
+  # re-write the whole source file in terms of the procedure being
+  # called.  To this end, we rename the original main function to
+  # something that will not conflict with our new main.
+  #
+  if ($is_child) {
+    s/main+/\_\_$function_name\_main/;
+  }
+  #
+  # We just assume, for simplicity, that the spawn keyword's options
+  # are all on the same line.  This is silly in the grand scheme of
+  # things, but it'll do for now.
+  #
+  if (/spawn\s*(.*?)\);/) {
+    #
+    # Thanks to the simple match above, we can split the spawn
+    # statement into it's two important parts: what call we are going
+    # to make and where the results of this operation are going to be
+    # stored.
+    #
+    my ($variable, $function) = split(/\s*\=\s*/,$1);
+    my ($name, $body) = split(/\s*\(/,$function);
+    #
+    # Since we need to create one child executable per spawn
+    # function, but we don't want to generate the same child code
+    # twice, we just keep a pseudo-set of the function names.
+    #
+    my @parameters = split(/\s*\,\s*/,$body);
+    my $n = scalar @parameters;
+    $children{$name} = $n;
+    #
+    # Extract all the parameter values we will be passing along to the
+    # child process.
+    #
+    my $s = join(", ", @parameters);
+    s/spawn[^;]+;/static int _$variable = 0; int __$variable = _$variable++; __birdcilk_spawn\(__$variable, "$name", "$variable", $n, $s\);/;
+    #
+    # Stash the variable name we will fill in at the sync statement.
+    # We will also use this to name the output file name for the
+    # Condor job.
+    #
+    push(@spawns, [$name, $variable]);
+  } 
+  #
+  # Similar to the spawn keyword, we just blindly match the sync
+  # statement and write the code to for the parent process to wait
+  # until all the child processes have compleated.  The order in which
+  # we evaluate the results of the child processes is not important.
+  # This is because we must wait for all children to terminate before
+  # continuing the execution.  Thus, it does not matter if the first
+  # child we block on happens to be the one that retuns it's results
+  # last, since we'd have had to wait for it later on anyway.
+  #
+  if (/sync/) {
+    my $code;
+    foreach my $pair (@spawns) {
+      $code .= "__birdcilk_wait(__@$pair[1], \"" . join('", "', @$pair) . "\", &@$pair[1]); ";
+    }
+    s/sync.*;$/$code/m;
+  } 
+  print OUTPUT "$_\n";
+}
+
+#
+# Both child and parent need the following code
+#
+print OUTPUT <<'EOT';
+
+void
+__birdcilk_cleanup(int        id,
+		   char const *function, 
+		   char const *variable)
+{
+  int  error;
+  char base[_POSIX_PATH_MAX],
+       command[_POSIX_PATH_MAX];
+
+  fprintf(stderr, "BIRDCILK: Entering __birdcilk_cleanup(%d, %s, %s)\n",
+	  id, function, variable);
+
+  /* Generate the command-line required to clean up */
+  sprintf(base, "/tmp/%s.%s.%d.%d.%d", function, variable,
+          __BIRDCILK_CLUSTER_ID, __BIRDCILK_PROCESS_ID, id);
+  sprintf(command, "/bin/rm -f %s.*", base, base);
+  
+  /* Wait for the child job to finish */
+  if (0 != (error = system(command))) {
+    fprintf(stderr, "BIRDCILK: Error: Failed to clean "
+	    "up droppings (%d).\n", error);
+    exit(1);
+  }
+
+  fprintf(stderr, "BIRDCILK: Leaving __birdcilk_cleanup(%d, %s, %s)\n",
+	  id, function, variable);
+
+}
+
+void
+__birdcilk_spawn(int        id,
+		 char const *function, 
+		 char const *variable, 
+		 int        n, ...)
+{
+  int          i, j, fd, priority;
+  double       d;
+  char         base[_POSIX_PATH_MAX],
+               submit_file[_POSIX_PATH_MAX],
+               log_file[_POSIX_PATH_MAX],
+               output_file[_POSIX_PATH_MAX],
+               error_file[_POSIX_PATH_MAX],
+               submit_exec[_POSIX_PATH_MAX],          
+               child_exec[_POSIX_PATH_MAX],
+               command[_POSIX_PATH_MAX],
+               format[1024],
+               format2[1024],
+               name[1024];
+  char         *user_file[] = { log_file, output_file, error_file };
+  FILE         *file, 
+               *submission;
+  struct group *cilk_group;
+  va_list      parameters;
+
+  fprintf(stderr, "BIRDCILK: Entering __birdcilk_spawn(%d, %s, %s)\n",
+	  id, function, variable);
+
+  /* Make some short names out of variables we will use a number 
+     of times bellow */
+  priority = __BIRDCILK_PRIORITY;
+
+  /* Generate the submit file name and then the command-line required
+     to submit the job */
+  sprintf(base, "/tmp/%s.%s.%d.%d.%d", function, variable,
+          __BIRDCILK_CLUSTER_ID, __BIRDCILK_PROCESS_ID, id);
+  sprintf(submit_file, "%s.submit", base);
+  sprintf(submit_exec, "%s/bin/condor_submit", __BIRDCILK_CONDOR_HOME);
+  sprintf(command, "%s %s", submit_exec, submit_file);
+
+  /* Make sure the executable exists */
+  if (0 != access(submit_exec, R_OK | X_OK)) {
+    fprintf(stderr, "BIRDCILK: Error: Cannot access "
+            "condor_submit: %s\n", submit_exec);
+    exit(1);
+  }
+
+  /* Generate the child executable name */
+  sprintf(child_exec, "/home/burnett/projects/birdcilk/%s.child", function);
+  
+  /* Make sure child executable exists and can be read
+     and executed */
+  if (0 != chmod(child_exec, 0755)) {
+    fprintf(stderr, "BIRDCILK: Error: Cannot set access "
+            "to child executable: %s\n", child_exec);
+    exit(1);
+  }
+
+#if 0
+  /* Get the gid of the group used to run the Condor daemons */
+  if (NULL == (cilk_group = getgrnam(__BIRDCILK_GROUP))) {
+    fprintf(stderr, "BIRDCILK: Error: Cannot find birdcilk group: "
+            "%s\n", __BIRDCILK_GROUP);
+    exit(1);
+  }
+#endif
+
+  /* Create the log, output and error files */
+  sprintf(log_file, "%s.log", base);
+  sprintf(output_file, "%s.output", base);
+  sprintf(error_file, "%s.error", base);
+
+  for (i = 0; i < 3; ++i) {
+    fprintf(stderr, "BIRDCILK: Touching %s.\n", user_file[i]);
+    if (-1 == (fd = open(user_file[i], O_WRONLY | O_CREAT))) {
+      fprintf(stderr, "BIRDCILK: Error: Failed to create user "
+              "file: %s.\n", user_file[i]);
+      exit(1);
+    }
+    if (0 != fchmod(fd, 0644)) {
+      fprintf(stderr, "BIRDCILK: Error: Cannot set access "
+              "to user file: %s\n", user_file[i]);
+      exit(1);
+    }    
+#if 0
+    if (0 != fchown(fd, -1, cilk_group->gr_gid)) {
+      fprintf(stderr, "BIRDCILK: Error: Cannot set group "
+              "for user file: %s\n", user_file[i]);
+      exit(1);
+    }
+#endif
+    if (0 != close(fd)) {
+      fprintf(stderr, "BIRDCILK: Error: Failed to close user "
+              "file: %s.\n", user_file[i]);
+      exit(1);
+    }
+  }
+
+  /* Open the submission description file */
+  file = fopen(submit_file, "w");
+  if (NULL == file) {
+    fprintf(stderr, "BIRDCILK: Error: Failed to open submission "
+	   "description file: %s.\n", submit_file);
+    exit(1);
+  }
+  
+  /* Write submission description */
+  fprintf(file, "universe = vanilla\n");
+  fprintf(file, "executable = %s\n", child_exec);
+  fprintf(file, "requirements = SupportsBirdCilkJobs =?= True\n", child_exec);
+  fprintf(file, "log = %s\n", log_file);
+  fprintf(file, "output = %s\n", output_file);
+  fprintf(file, "error = %s\n", error_file);
+  fprintf(file, "priority = %d\n", priority+1);
+  fprintf(file, "should_transfer_files = yes\n");
+  fprintf(file, "when_to_transfer_output = on_exit\n");
+  //fprintf(file, "transfer_input_files = %s\n", child_exec);
+  //fprintf(file, "transfer_output_files = %s.output\n", base);
+  //fprintf(file, "run_as_owner = false\n");
+  //fprintf(file, "transfer_output_remaps = \"%s.output = result\"\n", base);  
+  //fprintf(file, "initialdir = /tmp/\n");
+  fprintf(file, "transfer_executable = false\n");
+  
+  /* Format the argument list */
+  sprintf(format, "arguments = $(Cluster) $(Process) %d", priority+2);
+  for (i = 0; i < n; ++i) {
+    strcat(format, " %lf");
+  }
+  strcat(format, "\n");
+  va_start(parameters, n);
+  vfprintf(file, format, parameters);
+  va_end(parameters);
+  
+  /* Finish up the description */
+  fprintf(file, "queue 1\n");
+  fclose(file);
+
+
+  /* Submit the job (use popen because we will we want to track
+     the job when we improve this code) */
+  submission = popen(command, "r");
+  if (NULL == submission) {
+    fprintf(stderr, "BIRDCILK: Error: Failed to submit child job.\n");
+    __birdcilk_cleanup(id, function, variable);
+    exit(1);
+  }
+  pclose(submission);
+
+  fprintf(stderr, "BIRDCILK: Leaving __birdcilk_spawn(%d, %s, %s)\n",
+	  id, function, variable);
+
+}
+
+void 
+__birdcilk_wait(int        id,
+                char const *function, 
+		char const *variable,
+		double     *presult) 
+{
+  int   priority, error;
+  char  base[_POSIX_PATH_MAX],
+        wait_exec[_POSIX_PATH_MAX],
+        command[_POSIX_PATH_MAX],
+        log_file[_POSIX_PATH_MAX],
+        output_file[_POSIX_PATH_MAX],
+        format[1024];
+  FILE  *file;
+
+  fprintf(stderr, "BIRDCILK: Entering __birdcilk_wait(%d, %s, %s)\n",
+	  id, function, variable);
+
+  /* Make some short names out of variables we will use a number 
+     of times bellow */
+  priority = __BIRDCILK_PRIORITY;
+
+  /* Re-create the log and output file names */
+  sprintf(base, "/tmp/%s.%s.%d.%d.%d", function, variable,
+          __BIRDCILK_CLUSTER_ID, __BIRDCILK_PROCESS_ID, id);
+  sprintf(log_file, "%s.log", base);
+  sprintf(output_file, "%s.output", base);
+  
+  /* Generate the command-line required to wait for the child
+     job to terminate */
+  sprintf(wait_exec, "%s/bin/condor_wait", __BIRDCILK_CONDOR_HOME);
+  sprintf(command, "%s %s 1>&2", wait_exec, log_file);
+
+  /* Make sure the executable exists */
+  if (0 != access(wait_exec, R_OK | X_OK)) {
+    fprintf(stderr, "BIRDCILK: Error: Cannot access "
+            "condor_wait: %s\n", wait_exec);
+    exit(1);
+  }
+
+  /* Make sure the log file exists */
+  if (0 != access(log_file, R_OK)) {
+    fprintf(stderr, "BIRDCILK: Error: Cannot access "
+            "the log file: %s\n", log_file);
+    exit(1);
+  }
+
+  /* Wait for the child job to finish */
+  if (0 != (error = system(command))) {
+    fprintf(stderr, "BIRDCILK: Error: Failed to wait "
+            "on child job (%d).\n", error);
+    __birdcilk_cleanup(id, function, variable);
+    exit(1);
+  }
+    
+  /* Read the result returned by the child */  
+  if (NULL == (file = fopen(output_file, "r"))) {
+    fprintf(stderr, "BIRDCILK: Error: Failed to open on "
+            "child results.\n");
+    __birdcilk_cleanup(id, function, variable);
+    exit(1);
+  }
+  
+  /* Read the results returned by this child */
+  if (1 != fscanf(file, "%lf", presult)) {
+    fprintf(stderr, "BIRDCILK: Error: Failed to read "
+            "child results.\n");
+    fclose(file);
+    __birdcilk_cleanup(id, function, variable);
+    exit(1);
+  }  
+  fclose(file);
+
+  /* Log the results */
+  fprintf(stderr, "BIRDCILK: Result: %lf\n", *presult);
+  
+  /* Clean up the child droppings */
+  __birdcilk_cleanup(id, function, variable);
+
+  fprintf(stderr, "BIRDCILK: Leaving __birdcilk_wait(%d, %s, %s)\n",
+	  id, function, variable);
+  
+}
+EOT
+
+#
+# For each spawn statement we need to create a child process.  That
+# is, we need to re-generate the code with a new main function that is
+# writen in terms of the function that was spawned.  For instance, if
+# we had code like:
+#
+#    spawn x = foo(a1, a2, ..., aN);
+#
+# We would want an executable called foo.child that would take N
+# command line parameters and print the result of invoking foo() to
+# standard-out.
+#
+if ($is_parent) {
+  while (my ($child, $n) = each(%children)) {
+    exec "$myself --name=$child --input=$input_file --output=$function_name.child.cc --parameters=$n --child=1" or die
+      'Failed to exec child generator';
+  }
+  exit;
+}
+
+#
+# For child processes we need to write a new entry-point function.
+# This will automatically parse the input from the command-line and
+# pass the results of this on to the procedure the child is reponsible
+# for running.
+#
+if ($is_child) {
+print OUTPUT <<'EOT';
+
+int
+main (int argc, char **argv) {
+  double a[__BIRDCILK_N], r;
+  int    i;
+  char   name[1024];
+  char   *value;
+
+  /* Bail if we do not have enough information */
+#if 0
+  if (argc < 4) {
+    fprintf(stderr, "BIRDCILK: Error: Insufficient "
+            "command-line arguments (argc=%d).\n", argc);
+    exit(1);
+  }
+#endif
+
+  system("hostname 1>&2");
+
+  /* Extract the cluster-id for this process */
+  sscanf(argv[1], "%d", &__BIRDCILK_CLUSTER_ID);
+  fprintf(stderr, "Cluster ID: %d\n", __BIRDCILK_CLUSTER_ID);
+  
+  /* Extract the process-id for this process */
+  sscanf(argv[2], "%d", &__BIRDCILK_PROCESS_ID);
+  fprintf(stderr, "Process ID: %d\n", __BIRDCILK_PROCESS_ID);
+
+  /* Extract the priority for this process */
+  sscanf(argv[3], "%d", &__BIRDCILK_PRIORITY);
+  fprintf(stderr, "Priority: %d\n", __BIRDCILK_PRIORITY);
+  
+  /* Extract the parameters we will use in the procedure call bellow */
+  for (i = 0; i < __BIRDCILK_N; ++i) {
+    if (1 != sscanf(argv[i+4], "%lf", &a[i])) {
+      a[i] = 0.0;
+    }
+  }
+
+  /* Now make the call to the procedure */
+EOT
+
+  print OUTPUT "  r = ", $function_name, "(";
+  my $line = "";
+  $line .= "a[$_] " for(0..$parameter_count-1);
+  print OUTPUT join(", ", split(/ /, $line)), ");\n";
+
+print OUTPUT <<'EOT';
+
+  /* Print the results of the procedure call */
+  printf("%lf", r);
+
+  /* Return success so that Condor will not reschedule us */
+  return 0;
+}
+EOT
+}
+
